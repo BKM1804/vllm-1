@@ -32,6 +32,8 @@ from vllm.utils import merge_async_iterators
 
 logger = init_logger(__name__)
 
+global check_repeat 
+check_repeat = 0
 
 class OpenAIServingCompletion(OpenAIServing):
 
@@ -243,12 +245,15 @@ class OpenAIServingCompletion(OpenAIServing):
         tokenizer: AnyTokenizer,
         request_metadata: RequestResponseMetadata,
     ) -> AsyncGenerator[str, None]:
+        global check_repeat
+        check_repeat = 0
         num_choices = 1 if request.n is None else request.n
         previous_text_lens = [0] * num_choices * num_prompts
         previous_num_tokens = [0] * num_choices * num_prompts
         has_echoed = [False] * num_choices * num_prompts
         num_prompt_tokens = [0] * num_prompts
-
+        list_response = []
+        list_response_tokens = []
         stream_options = request.stream_options
         if stream_options:
             include_usage = stream_options.include_usage
@@ -256,7 +261,6 @@ class OpenAIServingCompletion(OpenAIServing):
                                        stream_options.continuous_usage_stats
         else:
             include_usage, include_continuous_usage = False, False
-
         try:
             async for prompt_idx, res in result_generator:
                 prompt_token_ids = res.prompt_token_ids
@@ -272,6 +276,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     int, Logprob]]]]
 
                 for output in res.outputs:
+                    
                     i = output.index + prompt_idx * num_choices
 
                     assert request.max_tokens is not None
@@ -342,9 +347,9 @@ class OpenAIServingCompletion(OpenAIServing):
                                     finish_reason=finish_reason,
                                     stop_reason=stop_reason,
                                 )
-                            ]
+                            ]    
                         )
-
+                        
                         if include_continuous_usage:
                             prompt_tokens = num_prompt_tokens[prompt_idx]
                             completion_tokens = previous_num_tokens[i]
@@ -356,6 +361,24 @@ class OpenAIServingCompletion(OpenAIServing):
 
                         response_json = chunk.model_dump_json(exclude_unset=False)
                         yield f"data: {response_json}\n\n"
+
+                        list_response_tokens.append(logprobs.tokens[token_index])
+                        list_response.append(response_json)
+                    await check_repetition(list_response_tokens , min_length = 3 , max_length = 100)
+                    if check_repeat > 0:
+                        x = 1
+                        for i in range(request.max_tokens - len(list_response)):
+                            yield f"data: {list_response[-(check_repeat - x%check_repeat + 1)]}\n\n"
+                            # yield f"data: 1"
+                            x +=1
+                        final_usage_info = UsageInfo(
+                            prompt_tokens=sum(num_prompt_tokens),
+                            completion_tokens= request.max_tokens,
+                            total_tokens=sum(num_prompt_tokens) + request.max_tokens)
+                        request_metadata.final_usage_info = final_usage_info
+                        # print("###############################################################################################")
+                        yield "data: [DONE]\n\n"
+                        return
 
             total_prompt_tokens = sum(num_prompt_tokens)
             total_completion_tokens = sum(previous_num_tokens)
@@ -374,10 +397,11 @@ class OpenAIServingCompletion(OpenAIServing):
                 )
                 final_usage_data = (final_usage_chunk.model_dump_json(
                     exclude_unset=False, exclude_none=True))
+                
                 yield f"data: {final_usage_data}\n\n"
-
             # report to FastAPI middleware aggregate usage across all choices
             request_metadata.final_usage_info = final_usage_info
+
 
         except Exception as e:
             # TODO: Use a vllm-specific Validation Error
@@ -551,3 +575,26 @@ class OpenAIServingCompletion(OpenAIServing):
             tokens=out_tokens,
             top_logprobs=out_top_logprobs,
         )
+
+
+async def check_repetition(lst , min_length = 3 , max_length = 10):
+    global check_repeat
+    if len(lst) < 3:
+        check_repeat = 0
+        return 0
+    for i in range(min_length,min(max_length,int(len(lst)/4))):
+        cnt = 0
+        j = len(lst)
+        while(j >= i ) :
+            if lst[j-i:j] == lst[j-2*i:j-i]:
+                cnt +=1
+                j -=i
+                if cnt >= 4:
+                    check_repeat = i
+                    return i
+                continue
+            else :
+                break
+            j -=1
+    check_repeat = 0
+    return 0
